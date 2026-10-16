@@ -1,0 +1,19 @@
+{
+  // Plugin Updates (emanuel.plugin-updates). Paste these rows into
+  // ~/.config/omarchy/extensions/omarchy-menu.jsonc.
+  //
+  // Update > Plugins and Setup > Plugins > Update Plugins are always shown and
+  // check the remotes when you pick them. The root "Plugin Updates" row is the
+  // suggestion: it shows only while updates are waiting, read from the cache
+  // the shell service keeps fresh, so opening the menu never waits on the
+  // network. New root rows land after System; the menu has no ordering field.
+  "update.plugins": {"icon":"󰐱","label":"Plugins",
+    "description":"Check installed shell plugins for updates",
+    "action":"omarchy-launch-floating-terminal-with-presentation omarchy-plugin-updates apply"},
+  "setup.plugin.update": {"icon":"󰚰","label":"Update Plugins",
+    "action":"omarchy-launch-floating-terminal-with-presentation omarchy-plugin-updates apply"},
+  "plugin-updates": {"icon":"󰚰","label":"Plugin Updates",
+    "description":"Updates are waiting for your installed plugins",
+    "when":"omarchy-plugin-updates pending -q",
+    "action":"omarchy-launch-floating-terminal-with-presentation omarchy-plugin-updates apply"}
+}

@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# Plugin Updates (emanuel.plugin-updates): offer plugin updates at the end of
+# `omarchy update`. Install with:
+#   omarchy hook install post-update ~/.config/omarchy/plugins/emanuel.plugin-updates/extras/plugin-updates.hook
+#
+# The logic lives in the CLI so it updates with the plugin; this copy only
+# calls it, and never fails the update.
+command -v omarchy-plugin-updates >/dev/null && omarchy-plugin-updates post-update
+exit 0

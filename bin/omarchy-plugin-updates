@@ -1,0 +1,265 @@
+#!/bin/bash
+
+# omarchy-plugin-updates: find upstream changes for git-installed Omarchy shell
+# plugins and hand them to `omarchy plugin update`, which shows the diff and
+# asks before applying anything. This script only ever fetches.
+#
+#   omarchy-plugin-updates check [--quiet] [--offline] [id]
+#   omarchy-plugin-updates pending [-q]
+#   omarchy-plugin-updates apply [id]
+#   omarchy-plugin-updates post-update      (run by the post-update hook)
+#
+# check and pending exit 0 when updates are waiting and 1 when there are none,
+# like omarchy-update-available. check exits 2 when no remote could be reached.
+
+set -uo pipefail
+
+PLUGINS_DIR="$HOME/.config/omarchy/plugins"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-plugin-updates.json"
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-plugin-updates.lock"
+FETCH_TIMEOUT=20
+
+# Same non-interactive git setup as omarchy-plugin-update.
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
+
+usage() {
+  sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+fail() {
+  echo "omarchy-plugin-updates: $*" >&2
+  exit 2
+}
+
+# Git-managed plugins with an origin, the set `omarchy plugin update` walks.
+git_plugins() {
+  local dir
+  for dir in "$PLUGINS_DIR"/*/; do
+    dir=${dir%/}
+    [[ -e $dir/.git ]] || continue
+    git -C "$dir" remote get-url origin >/dev/null 2>&1 || continue
+    basename "$dir"
+  done
+}
+
+plugin_name() {
+  local name
+  name=$(jq -r '.name // empty' "$PLUGINS_DIR/$1/manifest.json" 2>/dev/null)
+  echo "${name:-$1}"
+}
+
+plural() {
+  (($1 == 1)) && echo "$1 new commit" || echo "$1 new commits"
+}
+
+# One JSON object for a plugin, compared against the remote commit $2.
+# Prints nothing when the plugin is up to date (or ahead of its remote).
+describe() {
+  local id=$1 dir="$PLUGINS_DIR/$1" remote=$2 head behind diverged=false
+  [[ -n $remote ]] || return 0
+  head=$(git -C "$dir" rev-parse -q --verify HEAD) || return 0
+  git -C "$dir" cat-file -e "$remote^{commit}" 2>/dev/null || return 0
+  [[ $head == "$remote" ]] && return 0
+  git -C "$dir" merge-base --is-ancestor "$remote" "$head" 2>/dev/null && return 0
+  git -C "$dir" merge-base --is-ancestor "$head" "$remote" 2>/dev/null || diverged=true
+  behind=$(git -C "$dir" rev-list --count "$head..$remote")
+  jq -cn --arg id "$id" --arg name "$(plugin_name "$id")" --argjson behind "$behind" \
+    --arg latest "$(git -C "$dir" log -1 --format=%s "$remote")" --arg remote "$remote" \
+    --argjson diverged "$diverged" \
+    '{id: $id, name: $name, behind: $behind, latest: $latest, remote: $remote, diverged: $diverged}'
+}
+
+# Serialized: the shell's background check and a manual `apply` must not fetch
+# the same repos at once. The lock is released as soon as the check is done.
+check() {
+  local rc
+  exec 9>"$LOCK"
+  flock -w 120 9 || fail "another check is still running"
+  check_locked "$@"
+  rc=$?
+  exec 9>&-
+  return $rc
+}
+
+check_locked() {
+  local quiet=0 offline=0 only="" id
+  while (($# > 0)); do
+    case $1 in
+    -q | --quiet) quiet=1 ;;
+    --offline) offline=1 ;;
+    -*) fail "unknown check option: $1" ;;
+    *) only=$1 ;;
+    esac
+    shift
+  done
+
+  local ids=()
+  if [[ -n $only ]]; then
+    [[ -e $PLUGINS_DIR/$only/.git ]] || fail "plugin '$only' is not a git checkout"
+    ids=("$only")
+  else
+    mapfile -t ids < <(git_plugins)
+  fi
+
+  if [[ -z ${WORK:-} ]]; then
+    WORK=$(mktemp -d)
+    trap 'rm -rf "$WORK"' EXIT
+  fi
+  rm -f "$WORK"/*
+
+  if ((!offline)); then
+    for id in "${ids[@]}"; do
+      (
+        timeout "$FETCH_TIMEOUT" git -C "$PLUGINS_DIR/$id" fetch --quiet origin HEAD 2>"$WORK/$id.err"
+        echo $? >"$WORK/$id.rc"
+      ) &
+    done
+    wait
+  fi
+
+  local previous='{"updates":[]}' failed=0 entries=() errors=() rc reason entry remote
+  [[ -s $CACHE ]] && previous=$(cat "$CACHE")
+
+  for id in "${ids[@]}"; do
+    rc=0
+    ((offline)) || rc=$(cat "$WORK/$id.rc" 2>/dev/null || echo 1)
+    if ((rc != 0)); then
+      failed=$((failed + 1))
+      reason=$(head -n 1 "$WORK/$id.err" 2>/dev/null)
+      ((rc == 124)) && reason="timed out after ${FETCH_TIMEOUT}s"
+      errors+=("$(jq -cn --arg id "$id" --arg reason "${reason:-fetch failed}" '{id: $id, reason: $reason}')")
+      # Keep what the last good check knew about this plugin.
+      entry=$(jq -c --arg id "$id" '.updates[]? | select(.id == $id)' <<<"$previous")
+    elif ((offline)); then
+      # A failed fetch empties FETCH_HEAD, so offline checks go by the remote
+      # commit the cache recorded, and FETCH_HEAD only for unseen plugins.
+      remote=$(jq -r --arg id "$id" '.updates[]? | select(.id == $id) | .remote' <<<"$previous")
+      [[ -n $remote ]] || remote=$(git -C "$PLUGINS_DIR/$id" rev-parse -q --verify FETCH_HEAD)
+      entry=$(describe "$id" "$remote")
+    else
+      entry=$(describe "$id" "$(git -C "$PLUGINS_DIR/$id" rev-parse -q --verify FETCH_HEAD)")
+    fi
+    [[ -n $entry ]] && entries+=("$entry")
+  done
+
+  if ((!offline && ${#ids[@]} > 0 && failed == ${#ids[@]})); then
+    ((quiet)) || echo "Could not reach any plugin remote. Offline?" >&2
+    return 2
+  fi
+
+  # A single-plugin check updates that plugin's entry and keeps the rest.
+  local json
+  json=$(jq -n --argjson checked "$(date +%s)" --arg only "$only" --argjson prev "$previous" \
+    --slurpfile updates <(printf '%s\n' "${entries[@]}") \
+    --slurpfile errors <(printf '%s\n' "${errors[@]}") '
+    {checked: $checked,
+     updates: ((if $only == "" then [] else [$prev.updates[]? | select(.id != $only)] end) + $updates),
+     errors: $errors}')
+  mkdir -p "$(dirname "$CACHE")"
+  printf '%s\n' "$json" >"$CACHE.tmp" && mv "$CACHE.tmp" "$CACHE"
+
+  if ((!quiet)); then
+    for entry in "${entries[@]}"; do
+      jq -r '"\(.name) (\(.id)): \(.behind) new commit\(if .behind == 1 then "" else "s" end), latest: \(.latest)\(if .diverged then " [local commits, needs a manual merge]" else "" end)"' <<<"$entry"
+    done
+    for entry in "${errors[@]}"; do
+      jq -r '"\(.id): could not check (\(.reason))"' <<<"$entry" >&2
+    done
+  fi
+  ((${#entries[@]} > 0))
+}
+
+# Cached updates that are still not in HEAD. No network, so it is cheap
+# enough for a menu `when:` guard, and it notices a manual `omarchy plugin update`.
+pending_rows() {
+  [[ -s $CACHE ]] || return 0
+  local id remote
+  while IFS=$'\t' read -r id remote; do
+    [[ -e $PLUGINS_DIR/$id/.git ]] || continue
+    git -C "$PLUGINS_DIR/$id" merge-base --is-ancestor "$remote" HEAD 2>/dev/null && continue
+    jq -c --arg id "$id" '.updates[] | select(.id == $id)' "$CACHE"
+  done < <(jq -r '.updates[]? | [.id, .remote] | @tsv' "$CACHE" 2>/dev/null)
+}
+
+pending() {
+  local quiet=0 rows
+  [[ ${1:-} == -q || ${1:-} == --quiet ]] && quiet=1
+  rows=$(pending_rows)
+  [[ -n $rows ]] || return 1
+  ((quiet)) || jq -r '"\(.name) (\(.id)): \(.behind) new commit\(if .behind == 1 then "" else "s" end)"' <<<"$rows"
+  return 0
+}
+
+apply() {
+  local only=${1:-} total rows id name
+  total=$(git_plugins | wc -l)
+  echo "Checking ${only:-$total git-managed plugins} for updates…"
+  check --quiet ${only:+"$only"}
+  (($? == 2)) && echo "Could not reach the plugin remotes. Check your connection and try again."
+
+  rows=$(pending_rows)
+  [[ -n $only ]] && rows=$(jq -c --arg id "$only" 'select(.id == $id)' <<<"$rows")
+  if [[ -z $rows ]]; then
+    echo "All plugins are up to date."
+    return 0
+  fi
+
+  # An array, not `while read … <<<`: the updater's confirm prompt must read
+  # the terminal, not the rest of this list.
+  local row_list=() row
+  mapfile -t row_list <<<"$rows"
+
+  echo
+  for row in "${row_list[@]}"; do
+    id=$(jq -r .id <<<"$row")
+    name=$(jq -r .name <<<"$row")
+    printf '\e[1m%s\e[0m (%s): %s\n' "$name" "$id" "$(plural "$(jq -r .behind <<<"$row")")"
+    git -C "$PLUGINS_DIR/$id" log --oneline --no-decorate -n 15 "HEAD..$(jq -r .remote <<<"$row")" | sed 's/^/  /'
+  done
+
+  for row in "${row_list[@]}"; do
+    id=$(jq -r .id <<<"$row")
+    echo
+    if [[ $(jq -r .diverged <<<"$row") == true ]]; then
+      echo "Skipping $id: it has local commits, so it can't be fast-forwarded. Merge it by hand in $PLUGINS_DIR/$id."
+      continue
+    fi
+    # Omarchy's own updater: shows the diff, asks, validates, rolls back on failure.
+    omarchy plugin update "$id" || echo "$id was not updated."
+  done
+
+  check --quiet --offline >/dev/null
+  return 0
+}
+
+# The tail end of `omarchy update`. `omarchy update -y` promises not to ask
+# anything, so unattended runs only report. Never fails the update.
+post_update() {
+  echo
+  printf '\e[1m%s\e[0m\n' "Plugin updates"
+  if [[ -n ${OMARCHY_UPDATE_UNATTENDED:-} || ! -t 0 || ! -t 1 ]]; then
+    check
+    case $? in
+    0) echo "Run omarchy-plugin-updates apply to review and install them." ;;
+    1) echo "All plugins are up to date." ;;
+    esac
+  else
+    apply
+  fi
+  return 0
+}
+
+cmd=${1:-}
+[[ $# -gt 0 ]] && shift
+case $cmd in
+check) check "$@" ;;
+pending) pending "$@" ;;
+apply) apply "$@" ;;
+post-update) post_update ;;
+-h | --help | help | "") usage ;;
+*)
+  usage >&2
+  exit 2
+  ;;
+esac

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "emanuel.plugin-updates",
+  "name": "Plugin Updates",
+  "version": "1.0.0",
+  "author": "Emanuel4100",
+  "license": "MIT",
+  "description": "Checks git-installed shell plugins for upstream changes and offers them from the Omarchy menu and at the end of omarchy update. Nothing is applied without your confirmation.",
+  "homepage": "https://github.com/Emanuel4100/omarchy-plugin-updates",
+  "repository": "https://github.com/Emanuel4100/omarchy-plugin-updates",
+  "kinds": ["service"],
+  "entryPoints": { "service": "Service.qml" }
+}
